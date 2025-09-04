@@ -47,23 +47,25 @@ if (linhas[0].IndexOf("IBGE", StringComparison.OrdinalIgnoreCase) >= 0 ||
 
 var municipios = new List<Municipio>(linhas.Length - startIndex);
 
-for (int i = startIndex; i < linhas.Length; i++)
+Parallel.ForEach(Enumerable.Range(startIndex, linhas.Length - startIndex), i =>
 {
     var linha = (linhas[i] ?? "").Trim();
-    if (string.IsNullOrWhiteSpace(linha)) continue;
-
+    if (string.IsNullOrWhiteSpace(linha)) return;
     var parts = linha.Split(';');
-    if (parts.Length < 5) continue;
-
-    municipios.Add(new Municipio
+    if (parts.Length < 5) return;
+    var m = new Municipio
     {
         Tom = Util.San(parts[0]),
         Ibge = Util.San(parts[1]),
         NomeTom = Util.San(parts[2]),
         NomeIbge = Util.San(parts[3]),
         Uf = Util.San(parts[4]).ToUpperInvariant()
-    });
-}
+    };
+    lock (municipios) // Protege acesso concorrente à lista
+    {
+        municipios.Add(m);
+    }
+});
 
 Console.WriteLine($"Registros lidos: {municipios.Count}");
 
@@ -86,57 +88,65 @@ var ufsOrdenadas = porUf.Keys
 Directory.CreateDirectory(outRoot);
 Console.WriteLine("Calculando hash por município e gerando arquivos por UF ...");
 
+List<Task> tasks = new List<Task>();
+
 foreach (var uf in ufsOrdenadas)
 {
-    var listaUf = porUf[uf];
-
-    // Ordena por Nome preferido para saída consistente
-    listaUf.Sort((a, b) => string.Compare(a.NomePreferido, b.NomePreferido, StringComparison.OrdinalIgnoreCase));
-
-    Console.WriteLine($"Processando UF: {uf} ({listaUf.Count} municípios)");
-    var swUf = Stopwatch.StartNew();
-    string outPath = Path.Combine(outRoot, $"municipios_hash_{uf}.csv");
-    using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
-    using (var swOut = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+    tasks.Add(Task.Run(() =>
     {
-        swOut.WriteLine("TOM;IBGE;NomeTOM;NomeIBGE;UF;Hash");
 
-        var listaJson = new List<object>();
-        int count = 0;
-        foreach (var m in listaUf)
+        var listaUf = porUf[uf];
+        // Ordena por Nome preferido para saída consistente
+        listaUf.Sort((a, b) => string.Compare(a.NomePreferido, b.NomePreferido, StringComparison.OrdinalIgnoreCase));
+
+        Console.WriteLine($"Processando UF: {uf} ({listaUf.Count} municípios)");
+        var swUf = Stopwatch.StartNew();
+        string outPath = Path.Combine(outRoot, $"municipios_hash_{uf}.csv");
+        using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (var swOut = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
         {
-            // Password: todos os campos concatenados; Salt: IBGE + “pepper” fixo (opcional)
-            string password = m.ToConcatenatedString();
-            byte[] salt = Util.BuildSalt(m.Ibge);
+            swOut.WriteLine("TOM;IBGE;NomeTOM;NomeIBGE;UF;Hash");
 
-            // Trabalho pesado real (PBKDF2/SHA-256)
-            string hashHex = Util.DeriveHashHex(password, salt, PBKDF2_ITERATIONS, HASH_BYTES);
-
-            swOut.WriteLine($"{m.Tom};{m.Ibge};{m.NomeTom};{m.NomeIbge};{m.Uf};{hashHex}");
-
-            listaJson.Add(new {
-                m.Tom,
-                m.Ibge,
-                m.NomeTom,
-                m.NomeIbge,
-                m.Uf,
-                Hash = hashHex
-            });
-
-            count++;
-            if (count % 50 == 0 || count == listaUf.Count)
+            var listaJson = new List<object>();
+            int count = 0;
+            foreach (var m in listaUf)
             {
-                Console.WriteLine($"  Parcial: {count}/{listaUf.Count} municípios processados para UF {uf} | Tempo parcial: {FormatTempo(swUf.ElapsedMilliseconds)}");
+                // Password: todos os campos concatenados; Salt: IBGE + “pepper” fixo (opcional)
+                string password = m.ToConcatenatedString();
+                byte[] salt = Util.BuildSalt(m.Ibge);
+
+                // Trabalho pesado real (PBKDF2/SHA-256)
+                string hashHex = Util.DeriveHashHex(password, salt, PBKDF2_ITERATIONS, HASH_BYTES);
+
+                swOut.WriteLine($"{m.Tom};{m.Ibge};{m.NomeTom};{m.NomeIbge};{m.Uf};{hashHex}");
+
+                listaJson.Add(new
+                {
+                    m.Tom,
+                    m.Ibge,
+                    m.NomeTom,
+                    m.NomeIbge,
+                    m.Uf,
+                    Hash = hashHex
+                });
+
+                count++;
+                if (count % 50 == 0 || count == listaUf.Count)
+                {
+                    Console.WriteLine($"  Parcial: {count}/{listaUf.Count} municípios processados para UF {uf} | Tempo parcial: {FormatTempo(swUf.ElapsedMilliseconds)}");
+                }
             }
+            // Salva JSON
+            string jsonPath = Path.Combine(outRoot, $"municipios_hash_{uf}.json");
+            var json = JsonSerializer.Serialize(listaJson, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(jsonPath, json, Encoding.UTF8);
+            swUf.Stop();
+            Console.WriteLine($"UF {uf} concluída. Arquivos gerados: CSV e JSON. Tempo total UF: {FormatTempo(swUf.ElapsedMilliseconds)}");
         }
-        // Salva JSON
-        string jsonPath = Path.Combine(outRoot, $"municipios_hash_{uf}.json");
-        var json = JsonSerializer.Serialize(listaJson, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(jsonPath, json, Encoding.UTF8);
-        swUf.Stop();
-        Console.WriteLine($"UF {uf} concluída. Arquivos gerados: CSV e JSON. Tempo total UF: {FormatTempo(swUf.ElapsedMilliseconds)}");
-    }
+    }));
 }
+
+Task.WaitAll(tasks.ToArray());
 
 sw.Stop();
 Console.WriteLine();
